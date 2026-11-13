@@ -10,6 +10,7 @@ asking and links to the source code at its foot (AGPL-3.0 section 13).
 from __future__ import annotations
 
 import html
+import re
 from dataclasses import dataclass
 
 LANGS = ("en", "fr", "de")
@@ -259,11 +260,18 @@ def t(key: str, lang: str, **kw: str) -> str:
     return text.format(**{k: v for k, v in kw.items()})
 
 
+_VERSION_DETAIL = re.compile(r"[0-9]+(?:\.[0-9]+){0,3}")
+
+
 def error_text(code: str, lang: str, app: str, detail: str = "") -> str:
     entry = ERRORS.get(code) or ERRORS["bad_request"]
     filler = ERROR_FILLERS.get(code) if code in ERRORS else None
-    extra = filler(detail, lang) if filler else {}
-    return (entry.get(lang) or entry["en"]).format(app=APP_NAMES.get(app, app), detail=detail, **extra)
+    shown = detail
+    if code in ("too_old", "nc_too_old"):
+        match = _VERSION_DETAIL.search(detail or "")
+        shown = match.group(0) if match else ""
+    extra = filler(shown, lang) if filler else {}
+    return (entry.get(lang) or entry["en"]).format(app=APP_NAMES.get(app, app), detail=shown, **extra)
 
 
 def e(value: object) -> str:
@@ -275,6 +283,7 @@ class Asking:
     verified_name: str | None
     claimed_name: str
     return_host: str
+    document_host: str = ""
 
     @property
     def name(self) -> str:
@@ -338,7 +347,10 @@ def _not_now(flow_id: str, csrf: str, lang: str) -> str:
 
 def _lead(asking: Asking, lang: str, app_name: str) -> str:
     if asking.verified_name:
-        return f'<p class="lead">{e(t("lead", lang, assistant=asking.verified_name, app=app_name))}</p>'
+        assistant = asking.verified_name
+        if asking.document_host:
+            assistant = f"{asking.verified_name} ({asking.document_host})"
+        return f'<p class="lead">{e(t("lead", lang, assistant=assistant, app=app_name))}</p>'
     return f'<p class="lead">{e(t("wants.unverified", lang, name=asking.claimed_name, host=asking.return_host, app=app_name))}</p>'
 
 

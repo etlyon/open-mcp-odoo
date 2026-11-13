@@ -9,7 +9,6 @@ import time
 from typing import Any
 
 VERSION = 1
-ESTIMATED_LIFETIME_SECONDS = 90 * 24 * 60 * 60
 WARNING_SECONDS = 7 * 24 * 60 * 60
 
 
@@ -76,43 +75,3 @@ def decode(value: str, *, base_url: str, database: str) -> OdooCredential:
     ):
         raise ValueError("The stored Odoo credential metadata is invalid.")
     return OdooCredential(key, row_url.rstrip("/"), row_database, expires_at, source)
-
-
-def parse_odoo_datetime(value: object) -> int | None:
-    if value in (None, False, ""):
-        return None
-    if not isinstance(value, str):
-        raise ValueError("invalid Odoo expiration date")
-    text = value.strip().replace("Z", "+00:00")
-    parsed = dt.datetime.fromisoformat(text)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
-    return int(parsed.timestamp())
-
-
-async def expiry_for_key(client: Any, uid: int, *, now: float | None = None) -> tuple[int | None, str]:
-    """Read the one eBot key record when Odoo exposes it; otherwise use D249's 90-day bound.
-
-    A returned false expiration is authoritative and intentionally creates no reminder.
-    Missing, ambiguous or ACL-refused metadata is never guessed as a particular Odoo
-    record; the conservative fallback starts at the successful connection time.
-    """
-    current = time.time() if now is None else now
-    try:
-        rows = await client.call(
-            "res.users.apikeys",
-            "search_read",
-            {
-                "domain": [["user_id", "=", uid], ["name", "=", "eBot"]],
-                "fields": ["name", "user_id", "expiration_date", "create_date"],
-                "limit": 2,
-                "order": "create_date desc",
-            },
-            enforce_allowlist=False,
-            safe_read=True,
-        )
-        if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
-            return parse_odoo_datetime(rows[0].get("expiration_date")), "odoo"
-    except Exception:
-        pass
-    return int(current + ESTIMATED_LIFETIME_SECONDS), "estimated-90-days"

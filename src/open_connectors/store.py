@@ -157,6 +157,7 @@ class Connection:
     resource: str
     display: dict[str, Any]
     secret: dict[str, Any]
+    scope: str = ""
 
 
 @dataclass(frozen=True)
@@ -403,7 +404,7 @@ class Store:
         app, server, user = row[0], row[1], row[2]
         secret = _open(grant.data_key, {"conn": grant.conn_id, "app": app, "server": server, "user": user}, bytes(row[6]))
         return Connection(conn_id=grant.conn_id, app=app, server=server, remote_user=user, client_id=row[3],
-                          resource=row[4], display=json.loads(row[5]), secret=secret)
+                          resource=row[4], display=json.loads(row[5]), secret=secret, scope=grant.scope or "")
 
     def touch(self, conn_id: str) -> None:
         with self._tx() as db:

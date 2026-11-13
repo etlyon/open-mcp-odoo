@@ -12,6 +12,9 @@ Please report security problems **privately** to **contact@etlyon.com**, not in 
 - **Tools never read files from the connector's machine** on a caller's request; attachments travel only as bytes (a test scans the source to keep it so).
 
 ## Residual risks the operator should know
+- Records, files and mail returned by tools are untrusted server data, not instructions. A model can still request an ordinary undoable write after reading hostile data; use OAuth scopes and per-account policy to narrow writes. Destructive and send actions always require the person's form confirmation.
+- Rate limits (sign-in and each connection's upstream calls) are counted in one process. A second worker does not share them.
+- PDF text is read in a short-lived child with a size, memory and time cap. A hostile PDF can still cost that cap once per call.
 - A connector reachable from the internet is a way to reach the servers people type. Keep the egress firewall of the host tight and use the denied-hosts setting for your own internal services that have public names.
 - **Device-flow phishing (Hub).** Nextcloud's approval page is a plain link. Someone could start a sign-in on a connector they control and send a person that link; a person who then clicks Grant access gives that app password away. Nextcloud's page names the app asking ("Assistant connector"); people should grant access only from a page they opened themselves, in their own assistant. The connect window never asks anyone to send the link on.
 - An app password whose connection expired unused (30 days) can no longer be opened by anyone, so the connector cannot delete it in Nextcloud; it stays listed under *Settings › Security*, where the person can delete it. The same holds for an app password from a sign-in the person left without *Not now* (the window closed, or Grant access clicked only afterwards).

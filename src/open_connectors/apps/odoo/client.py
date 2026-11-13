@@ -8,6 +8,7 @@ road in :mod:`open_connectors.net` (checked public IP, no proxy, no redirect).
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from urllib.parse import quote
 
@@ -15,6 +16,9 @@ import httpx
 
 from open_connectors import identity, net
 from open_connectors.apps.odoo.credential import OdooCredential
+from open_connectors.throttle import Throttle
+
+THROTTLE = Throttle()
 
 
 class OdooAPIError(RuntimeError):
@@ -182,6 +186,9 @@ class OdooClient:
         if self.database:
             headers["X-Odoo-Database"] = self.database
         attempts = READ_ATTEMPTS if method in SAFE_RETRY_METHODS else 1
+        wait = THROTTLE.take(_throttle_key(self))
+        if wait:
+            raise OdooAPIError("Too many requests from this connection; nothing was sent.", category="rate_limited")
         async with httpx.AsyncClient(
             timeout=self.timeout,
             transport=self.transport,
@@ -208,7 +215,9 @@ class OdooClient:
     ) -> Any:
         for attempt in range(attempts):
             try:
-                return self._decode(await client.request(method, url, **kwargs))
+                async with client.stream(method, url, **kwargs) as response:
+                    body = await net.read_capped(response, net.DEFAULT_MAX_BYTES)
+                    return self._decode(response, body)
             except net.AddressError as exc:
                 raise OdooAPIError(
                     "Could not reach this Odoo safely.", category="unreachable", source_type=exc.code
@@ -220,11 +229,11 @@ class OdooClient:
         raise AssertionError("unreachable")
 
     @staticmethod
-    def _decode(response: httpx.Response) -> Any:
+    def _decode(response: httpx.Response, body: bytes) -> Any:
         category, retryable = _status_classification(response.status_code)
         try:
-            payload = response.json()
-        except ValueError as exc:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
             raise OdooAPIError(
                 f"Odoo returned non-JSON HTTP {response.status_code}.",
                 category=category if response.is_error else "invalid_response",
@@ -240,6 +249,13 @@ class OdooClient:
                 retryable=retryable,
             )
         return payload
+
+
+def _throttle_key(client: OdooClient) -> str:
+    try:
+        return identity.current_connection().conn_id
+    except identity.IdentityRefused:
+        return client.base_url or "odoo"
 
 
 REFUSED_STORED_KEY = (

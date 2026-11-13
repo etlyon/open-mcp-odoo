@@ -20,35 +20,32 @@ exactly (an unknown key, a list that is not a list of names, a name given
 twice) refuses every tool (fail closed).
 
 *Ask* is enforced here, by the server, whatever the client shows. A call to an
-ask tool runs only after one of, in order:
-
-(a) a valid, unused ``confirm_token`` for (account, tool, arguments);
-(b) the user's answer to a form elicitation the request declares it supports:
-    on 2026-07-28 an ``InputRequiredResult`` with one boolean ``confirm``
-    request (the framework seals ``request_state``); on a handshake connection
-    ``ctx.elicit``. A refusal ends the call; a failure to ask falls to (c);
-(c) otherwise nothing runs, and the result is ``status: confirmation_required``
-    with a single-use token to repeat the same call with.
+ask tool runs only after the person's own answer in the assistant's confirmation
+form (form elicitation). The server never puts a ``confirm_token`` in a tool
+result: a model that can read the result must not be able to produce the
+confirmation. If the client cannot ask the person, nothing runs.
 
 ``tools/list`` advertises the decision in each tool's ``meta``
-(``open-connectors/decision``, plus ``anthropic/requiresUserInteraction`` for ask) and
-adds the optional ``confirm_token`` argument, which is removed again before the
-tool body validates its arguments. Each ask writes one log line naming the
-tool, the channel and the outcome; never an argument, an account or a token.
+(``open-connectors/decision``, plus ``anthropic/requiresUserInteraction`` for ask).
+A ``confirm_token`` argument, if a caller sends one, is removed and the call is
+refused. Each ask writes one log line naming the tool, the channel and the
+outcome; never an argument, an account or a token.
+
+The connection's OAuth scope is applied here too. ``read`` covers read-only tools,
+``write`` covers ordinary writes (and reads), ``send`` covers destructive and
+mandatory-ask tools (and writes and reads). ``offline_access`` refreshes the
+sign-in and grants no tool. A missing policy file is the annotation defaults;
+a policy file that cannot be read refuses every tool.
 """
 
 from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import hmac
-import json
 import logging
 import os
 import re
-import threading
-import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,7 +56,7 @@ import yaml
 from fastmcp.exceptions import ToolError
 from fastmcp.server.elicitation import AcceptedElicitation
 from fastmcp.server.middleware import Middleware, MiddlewareContext
-from fastmcp.tools import InputRequiredToolResult, ToolResult
+from fastmcp.tools import InputRequiredToolResult
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
 from open_connectors import identity, journal
@@ -79,27 +76,13 @@ DENIED = "denied"
 
 CONFIRM_TOKEN = "confirm_token"
 CONFIRM_REQUEST = "confirm"
-TOKEN_TTL_SECONDS = 300
 LEGACY_ELICITATION_TIMEOUT_SECONDS = 15.0
 SUMMARY_MAX_CHARS = 2000
 DECISION_META = "open-connectors/decision"
 INTERACTION_META = "anthropic/requiresUserInteraction"
 
-CONFIRM_TOKEN_SCHEMA: dict[str, Any] = {
-    "type": "string",
-    "description": (
-        "Only when repeating a call whose result was status confirmation_required, after the user "
-        "agreed: the confirm_token from that result. It works once, for exactly that call."
-    ),
-}
-
-_TOKEN_PATTERN = re.compile(r"[0-9]{1,20}\.[0-9a-f]{64}")
-_MICROSECONDS = 1_000_000
-_FUTURE_SKEW_SECONDS = 60
-
-
 def _confirmation_arguments(tool: Any, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Bind consent to the action, excluding declared transport retry keys.
+    """Bind the person's form answer to the action, excluding declared transport retry keys.
 
     A confirming call is a new logical call and may have a newly generated
     idempotency key. Free-form business data is left intact: only properties
@@ -134,10 +117,6 @@ def _confirmation_arguments(tool: Any, arguments: dict[str, Any]) -> dict[str, A
 
 class PolicyError(StoreError):
     """The account's policy file cannot be applied; every tool is refused."""
-
-
-def _now() -> float:
-    return time.time()
 
 
 class _PolicyLoader(yaml.SafeLoader):
@@ -220,56 +199,42 @@ def load_policy(path: Path) -> Policy:
     return Policy(**lists)
 
 
-class ConfirmationTokens:
-    """Single-use confirmations for one process.
+def policy_for_account(account: str) -> Policy:
+    """``OPEN_CONNECTORS_ACCOUNTS_DIR/<account>/policy.yaml``, or the defaults when the root is unset.
 
-    A token is ``<issued_ts>.<hex HMAC-SHA256(key, account\\ntool\\nfingerprint\\nissued_ts)>``
-    with ``issued_ts`` in microseconds and a key from ``os.urandom(32)`` at
-    start, valid for 300 seconds and once. Each issuance is distinct, so a
-    second confirmation of the same call is never mistaken for the used first
-    one. A restart invalidates every open confirmation; the caller is asked again.
+    A missing file is the defaults. An unreadable or invalid file refuses every tool.
     """
+    raw = os.environ.get("OPEN_CONNECTORS_ACCOUNTS_DIR", "").strip()
+    if not raw:
+        return Policy()
+    if not account or account in {".", ".."} or any(ch in account for ch in "/\\\x00") or len(account) > 200:
+        raise PolicyError("this account has no usable policy name; every tool is refused.")
+    root = Path(raw).resolve()
+    folder = (root / account).resolve()
+    if folder.parent != root:
+        raise PolicyError("this account has no usable policy name; every tool is refused.")
+    return load_policy(folder / "policy.yaml")
 
-    def __init__(self, key: bytes | None = None, ttl: int = TOKEN_TTL_SECONDS) -> None:
-        self._key = key if key is not None else os.urandom(32)
-        self.ttl = ttl
-        self._used: dict[str, int] = {}
-        self._last_issued = 0
-        self._lock = threading.Lock()
 
-    def _mac(self, account: str, tool: str, fingerprint: str, issued: int) -> str:
-        message = f"{account}\n{tool}\n{fingerprint}\n{issued}".encode("utf-8", "surrogatepass")
-        return hmac.new(self._key, message, hashlib.sha256).hexdigest()
+def tool_scope(name: str, annotations: Any, mandatory_ask: frozenset[str]) -> str:
+    """The access a tool needs: ``read``, ``write`` or ``send``."""
+    if name in mandatory_ask or getattr(annotations, "destructive_hint", None) is True:
+        return "send"
+    if getattr(annotations, "read_only_hint", None) is True:
+        return "read"
+    return "write"
 
-    def issue(self, account: str, tool: str, fingerprint: str) -> str:
-        with self._lock:
-            issued = int(_now() * _MICROSECONDS)
-            if issued <= self._last_issued < issued + _MICROSECONDS:
-                issued = self._last_issued + 1  # two issuances in one instant stay distinct
-            self._last_issued = issued
-        return f"{issued}.{self._mac(account, tool, fingerprint, issued)}"
 
-    def redeem(self, token: object, account: str, tool: str, fingerprint: str) -> str | None:
-        """Consume ``token`` if it confirms exactly this call; otherwise return why it is refused."""
-        if not isinstance(token, str) or not _TOKEN_PATTERN.fullmatch(token):
-            return "malformed"
-        issued_text, _, mac = token.partition(".")
-        issued = int(issued_text)
-        if not hmac.compare_digest(mac, self._mac(account, tool, fingerprint, issued)):
-            return "not issued for this account, tool and arguments"
-        now = int(_now() * _MICROSECONDS)
-        if now - issued > self.ttl * _MICROSECONDS:
-            return "expired"
-        if issued > now + _FUTURE_SKEW_SECONDS * _MICROSECONDS:
-            return "not valid yet"
-        with self._lock:
-            for used, expiry in list(self._used.items()):
-                if expiry < now:
-                    del self._used[used]
-            if token in self._used:
-                return "already used"
-            self._used[token] = issued + self.ttl * _MICROSECONDS
-        return None
+def scope_allows(granted: str, need: str) -> bool:
+    """``write`` includes ``read``; ``send`` includes ``write`` and ``read``. Nothing else is implied."""
+    have = set((granted or "").split())
+    if need == "read":
+        return bool(have & {"read", "write", "send"})
+    if need == "write":
+        return bool(have & {"write", "send"})
+    if need == "send":
+        return "send" in have
+    return False
 
 
 class AccountToolPolicy(Middleware):
@@ -278,18 +243,14 @@ class AccountToolPolicy(Middleware):
         *,
         app: str,
         connect_tool: str,
-        tokens: ConfirmationTokens | None = None,
         annotations: Callable[[str], Any] | None = None,
         preview_tools: frozenset[str] = frozenset(),
-        modern_token_only: bool = False,
         mandatory_ask_tools: frozenset[str] = frozenset(),
         summary: Callable[[str, dict[str, Any]], Awaitable[str | None]] | None = None,
     ) -> None:
         self.app = app
         self.connect_tool = connect_tool
-        self.tokens = tokens if tokens is not None else ConfirmationTokens()
         self.preview_tools = preview_tools
-        self.modern_token_only = modern_token_only
         self.mandatory_ask_tools = mandatory_ask_tools
         # Optional: what an ask shows the person, per tool, from the call's arguments (kSuite: who gets
         # the mail and what it says). None, or a summary of None, keeps the generic question.
@@ -308,8 +269,8 @@ class AccountToolPolicy(Middleware):
 
     def _state(self, account: str) -> tuple[bool, Policy]:
         # A call reaches the tools only through the gate, with a live connection:
-        # always connected; the safe defaults from the tool annotations decide.
-        return True, Policy()
+        # always connected. The account file, when the operator set one, narrows that.
+        return True, policy_for_account(account)
 
     def _decision(self, policy: Policy, tool: str, annotations: Any) -> str:
         """Apply an adapter's non-bypassable approval boundary after deny.
@@ -340,11 +301,15 @@ class AccountToolPolicy(Middleware):
             connected, policy = self._state(identity.current_account())
         except (identity.IdentityRefused, StoreError):
             return []
-        return [
-            _advertise(tool, self._decision(policy, tool.name, self._annotations(tool)), self._annotations(tool))
-            for tool in tools
-            if self._refusal(tool.name, connected, policy) is None
-        ]
+        granted = identity.current_connection().scope
+        visible = []
+        for tool in tools:
+            if self._refusal(tool.name, connected, policy) is not None:
+                continue
+            if not scope_allows(granted, tool_scope(tool.name, self._annotations(tool), self.mandatory_ask_tools)):
+                continue
+            visible.append(_advertise(tool, self._decision(policy, tool.name, self._annotations(tool)), self._annotations(tool)))
+        return visible
 
     async def on_call_tool(self, context: MiddlewareContext[Any], call_next: Any) -> Any:
         name = context.message.name
@@ -367,6 +332,9 @@ class AccountToolPolicy(Middleware):
         if tool is None:
             raise ToolError(f"Unknown tool: {name!r}")
         decision = self._decision(policy, name, self._annotations(tool))
+        granted = identity.current_connection().scope
+        if not scope_allows(granted, tool_scope(name, self._annotations(tool), self.mandatory_ask_tools)):
+            raise ToolError(f"Tool '{name}' needs access this connection was not given; nothing ran.")
         if decision == ALLOWED:
             return await call_next(context)
         if decision != ASK:
@@ -407,18 +375,18 @@ class AccountToolPolicy(Middleware):
         name = tool.name
         protocol = _protocol(ctx)
         capability = _elicitation_capability(ctx)
-        # (a) a confirmation the caller already holds
+        # A token in the arguments is something the model can copy. It never authorizes a call.
         if token is not None:
-            reason = self.tokens.redeem(token, account, name, fingerprint)
-            if reason is not None:
-                _log_ask(name, "token", "refused", protocol=protocol, capability=capability)
-                raise ToolError(
-                    f"confirm_token refused ({reason}); nothing ran. Call {name} again without "
-                    "confirm_token to ask for a new confirmation."
-                )
-            _log_ask(name, "token", "accepted", protocol=protocol, capability=capability)
-            return await call_next(context)
-        # (b) ask the user through the client, or fall back to a token
+            _log_ask(name, "token", "refused", protocol=protocol, capability=capability)
+            raise ToolError(
+                f"{name} does not accept a confirm_token; nothing ran. "
+                "The person confirms in the assistant's own confirmation form."
+            )
+        if not _declares_form_elicitation(ctx):
+            _log_ask(name, "form", "refused", protocol=protocol, capability=capability)
+            raise ToolError(
+                f"{name} needs the person's confirmation, and this assistant cannot ask them; nothing ran."
+            )
         async def describe() -> str | None:
             return await self._describe(name, arguments or {})
 
@@ -442,9 +410,6 @@ class AccountToolPolicy(Middleware):
         capability: str,
         describe: Callable[[], Awaitable[str | None]] | None = None,
     ) -> Any:
-        if self.modern_token_only:
-            summary = await describe() if describe else None
-            return self._token_result(tool, account, fingerprint, protocol, capability, summary=summary)
         state = _form_state(account, tool.name, fingerprint)
         if ctx.request_state is not None or ctx.input_responses is not None:
             return await _form_answer(
@@ -457,10 +422,8 @@ class AccountToolPolicy(Middleware):
                 capability=capability,
             )
         summary = await describe() if describe else None
-        if _declares_form_elicitation(ctx):
-            _log_ask(tool.name, "form", "asked", protocol=protocol, capability=capability)
-            return _form_request(tool.name, state, summary)
-        return self._token_result(tool, account, fingerprint, protocol, capability, summary=summary)
+        _log_ask(tool.name, "form", "asked", protocol=protocol, capability=capability)
+        return _form_request(tool.name, state, summary)
 
     async def _ask_legacy(
         self,
@@ -482,7 +445,7 @@ class AccountToolPolicy(Middleware):
                     ctx.elicit(_question(tool.name, summary), response_type=bool),
                     timeout=LEGACY_ELICITATION_TIMEOUT_SECONDS,
                 )
-            except Exception as exc:  # any failure to ask falls back to a token
+            except Exception as exc:
                 elicit_error = type(exc).__name__
             else:
                 if isinstance(answer, AcceptedElicitation) and answer.data is True:
@@ -490,40 +453,18 @@ class AccountToolPolicy(Middleware):
                     return await call_next(context)
                 _log_ask(tool.name, "elicit", "declined", protocol=protocol, capability=capability)
                 raise ToolError(f"declined: {tool.name} was not confirmed; nothing ran.")
-        return self._token_result(tool, account, fingerprint, protocol, capability, elicit_error, summary=summary)
-
-    def _token_result(
-        self,
-        tool: Any,
-        account: str,
-        fingerprint: str,
-        protocol: str,
-        capability: str,
-        elicit_error: str | None = None,
-        *,
-        summary: str | None = None,
-    ) -> ToolResult:
-        confirm = self.tokens.issue(account, tool.name, fingerprint)
-        _log_ask(
-            tool.name,
-            "token",
-            "issued",
-            elicit_error,
-            protocol=protocol,
-            capability=capability,
-        )
-        return _confirmation_required(tool, confirm, self.tokens.ttl, summary)
-
+        _log_ask(tool.name, "form", "refused", elicit_error, protocol=protocol, capability=capability)
+        raise ToolError(f"{tool.name} needs the person's confirmation, and this assistant cannot ask them; nothing ran.")
 
 def _advertise(tool: Any, decision: str, annotations: Any = None) -> Any:
-    """A copy of ``tool`` with the optional ``confirm_token`` argument and the decision in ``meta``.
+    """A copy of ``tool`` with ``confirm_token`` removed and the decision in ``meta``.
 
     ``annotations``, when given, are the ones the decision was taken from and
     are advertised in place of the tool's own.
     """
     parameters = dict(tool.parameters or {})
     properties = dict(parameters.get("properties") or {})
-    properties[CONFIRM_TOKEN] = dict(CONFIRM_TOKEN_SCHEMA)
+    properties.pop(CONFIRM_TOKEN, None)
     parameters["properties"] = properties
     meta = {key: value for key, value in (tool.meta or {}).items() if key != INTERACTION_META}
     meta[DECISION_META] = decision
@@ -640,28 +581,6 @@ async def _form_answer(
         return await call_next(context)
     _log_ask(tool, "form", "declined", protocol=protocol, capability=capability)
     raise ToolError(f"declined: {tool} was not confirmed; nothing ran.")
-
-
-def _confirmation_required(tool: Any, confirm: str, ttl: int, summary: str | None = None) -> ToolResult:
-    payload: dict[str, Any] = {
-        "status": "confirmation_required",
-        "executed": False,
-        "tool": tool.name,
-        "confirm_token": confirm,
-        "expires_in": ttl,
-        "detail": (
-            f"{tool.name} asks before it runs for this account, and nothing ran. Ask the user whether to "
-            "run it with exactly these arguments. If they agree, repeat the same call with the same "
-            f"arguments plus confirm_token; the token works once, for this call only, for {ttl} seconds."
-        ),
-    }
-    if summary:
-        payload["summary"] = summary
-        payload["detail"] += " Show the user the summary, word for word, when you ask."
-    text = json.dumps(payload)
-    schema = tool.output_schema if isinstance(tool.output_schema, dict) else None
-    structured = {"result": text} if schema and schema.get("x-fastmcp-wrap-result") else None
-    return ToolResult(content=text, structured_content=structured)
 
 
 def _log_ask(

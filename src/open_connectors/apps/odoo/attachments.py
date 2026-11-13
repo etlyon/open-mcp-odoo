@@ -196,7 +196,8 @@ async def attachment_matches(client: OdooClient, params: Any) -> list[dict]:
     raw = _stored_bytes(params)
     if raw is None:
         return []
-    digest = hashlib.sha1(raw).hexdigest()
+    # Odoo's published duplicate-lookup checksum, never a signature or password hash.
+    digest = hashlib.sha1(raw, usedforsecurity=False).hexdigest()  # nosemgrep: python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
     return await client.call(
         "ir.attachment",
         "search_read",

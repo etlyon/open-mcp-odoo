@@ -34,7 +34,14 @@ from open_connectors.journal import IdempotencyKey, run_keyed
 from open_connectors.policy import AccountToolPolicy
 from open_connectors.reminder import KeyExpiryReminder
 from open_connectors.apps.odoo.client import ConnectionOdooClient, OdooAPIError, OdooClient
-from open_connectors.apps.odoo.guards import SAFE_MUTATION_CONTEXT, require_mutable_model, validate_values
+from open_connectors.apps.odoo.guards import (
+    SAFE_MUTATION_CONTEXT,
+    read_context,
+    require_mutable_model,
+    require_readable_fields,
+    require_readable_model,
+    validate_values,
+)
 from open_connectors.apps.odoo.attachments import (
     FileAttachmentInput,
     attach_pdf,
@@ -49,12 +56,43 @@ LOGGER = logging.getLogger("open_connectors.apps.odoo")
 APP = "odoo"
 CONNECT_TOOL = "odoo_connect"
 
-DEFAULT_ALLOWED_MODELS = {"*"}
+# Ordinary business records. ``*`` is not the default: an operator sets
+# ODOO_ALLOWED_MODELS=* (or a comma list) when they want a wider list.
+# Odoo ACLs stay authoritative. guards.py still blocks system and mail models.
+DEFAULT_ALLOWED_MODELS = {
+    "account.move",
+    "account.move.line",
+    "crm.lead",
+    "crm.stage",
+    "crm.team",
+    "product.category",
+    "product.product",
+    "product.template",
+    "project.project",
+    "project.task",
+    "purchase.order",
+    "purchase.order.line",
+    "res.company",
+    "res.partner",
+    "sale.order",
+    "sale.order.line",
+    "stock.move",
+    "stock.picking",
+}
 
-# Broad normal-user coverage is intentional. Odoo ACLs remain authoritative,
-# while guards.py blocks external communication, system administration,
-# and unsafe generic state changes. Explicit deletion follows Odoo ACLs.
-DEFAULT_MUTABLE_MODELS = {"*"}
+# Smaller than the read list: money documents and stock moves are read, not rewritten, by default.
+DEFAULT_MUTABLE_MODELS = {
+    "crm.lead",
+    "product.product",
+    "product.template",
+    "project.project",
+    "project.task",
+    "purchase.order",
+    "purchase.order.line",
+    "res.partner",
+    "sale.order",
+    "sale.order.line",
+}
 
 WORKFLOW_ACTIONS: dict[str, dict[str, Any]] = {
     "crm_mark_won": {
@@ -206,11 +244,6 @@ mcp = FastMCP(
             app=APP,
             connect_tool=CONNECT_TOOL,
             preview_tools=ODOO_PREVIEW_TOOLS,
-            # Modern form elicitation is a two-leg result with no server-side
-            # wait to bound. Odoo approvals therefore use the same-arguments,
-            # single-use token path; legacy imperative elicitation stays
-            # available with a bounded wait in the shared middleware.
-            modern_token_only=True,
         )
     ],
 )
@@ -617,6 +650,7 @@ async def _attachment_ref_state(params: Any) -> dict[str, Any]:
 
 async def _records_absent(params: Any) -> str | None:
     """Check-by-ref for delete: every target already absent means the work is done."""
+    require_readable_model(params.model)
     rows = await client.call(
         params.model, "read", {"ids": params.ids, "fields": ["id"], "load": None}
     )
@@ -638,6 +672,7 @@ async def _records_absent(params: Any) -> str | None:
 
 async def _records_ref_state(params: Any) -> dict[str, Any]:
     try:
+        require_readable_model(params.model)
         rows = await client.call(
             params.model, "read", {"ids": params.ids, "fields": ["id"], "load": None}
         )
@@ -648,6 +683,23 @@ async def _records_ref_state(params: Any) -> dict[str, Any]:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+
+
+def _safe_identity_context(value: Any) -> dict[str, Any]:
+    """Expose only the small identity context contract, never arbitrary res.users context."""
+    if not isinstance(value, dict):
+        raise OdooAPIError("Odoo returned no user context.", category="invalid_response")
+    uid = value.get("uid")
+    if type(uid) is not int or uid <= 0:
+        raise OdooAPIError("Odoo named no user.", category="invalid_response")
+    result: dict[str, Any] = {"uid": uid}
+    for key in ("lang", "tz"):
+        if isinstance(value.get(key), str):
+            result[key] = value[key]
+    company_ids = value.get("allowed_company_ids")
+    if isinstance(company_ids, list) and all(type(item) is int and item > 0 for item in company_ids[:100]):
+        result["allowed_company_ids"] = company_ids[:100]
+    return result
 
 
 def _error(exc: Exception) -> str:
@@ -704,6 +756,13 @@ def _connection_failure(exc: Exception) -> dict[str, Any]:
         "action": actions.get(category, actions["odoo_error"]),
         "credential_material_exposed": False,
     }
+
+
+def _guard_read(model: str, fields: list[str] | None, context: dict[str, Any] | None) -> dict[str, Any]:
+    """Refuse blocked models and fields, and keep only lang, tz and company ids."""
+    require_readable_model(model)
+    require_readable_fields(fields)
+    return read_context(context)
 
 
 def _return_fields(fields: list[str]) -> list[str]:
@@ -804,9 +863,10 @@ async def odoo_allowed_models() -> str:
 
 @mcp.tool(name="odoo_whoami", annotations=READ_ONLY)
 async def odoo_whoami() -> str:
-    """Return the Odoo context associated with the configured API key."""
+    """Return a filtered identity context for the configured API key."""
     try:
-        return _json(await client.call("res.users", "context_get", {}, enforce_allowlist=False))
+        context = await client.call("res.users", "context_get", {}, enforce_allowlist=False, safe_read=True)
+        return _json(_safe_identity_context(context))
     except Exception as exc:
         return _error(exc)
 
@@ -819,27 +879,21 @@ async def odoo_connection_status() -> str:
     """
     try:
         credential = client.credential_for_current_account()
-        context = await client.call("res.users", "context_get", {}, enforce_allowlist=False, safe_read=True)
-        uid = context.get("uid") if isinstance(context, dict) else None
-        if type(uid) is not int or uid <= 0:
-            raise OdooAPIError("Odoo named no user.", category="invalid_response")
-        users = await client.call(
-            "res.users", "read",
-            {"ids": [uid], "fields": ["id", "name", "login", "email", "active"], "load": None},
-            enforce_allowlist=False, safe_read=True,
+        context = _safe_identity_context(
+            await client.call("res.users", "context_get", {}, enforce_allowlist=False, safe_read=True)
         )
-        user = users[0] if isinstance(users, list) and len(users) == 1 and isinstance(users[0], dict) else None
-        if not user or user.get("id") != uid or user.get("active") is False:
-            raise OdooAPIError("Odoo returned no active user.", category="invalid_response")
+        connection = identity.current_connection()
+        display = connection.display if isinstance(connection.display, dict) else {}
+        uid = context["uid"]
         return _json({
             "status": "connected",
             "connected": True,
             "credential_verified_for_this_call": True,
             "identity": {
                 "uid": uid,
-                "display_name": user.get("name"),
-                "login": user.get("login") or user.get("email"),
-                "active": user.get("active"),
+                "display_name": display.get("name"),
+                "login": display.get("email"),
+                "active": True,
             },
             **credential.status(),
             "credential_material_exposed": False,
@@ -850,31 +904,34 @@ async def odoo_connection_status() -> str:
 
 @mcp.tool(name="odoo_model_catalog", annotations=READ_ONLY)
 async def odoo_model_catalog(params: ModelCatalogInput) -> str:
-    """Discover installed persistent Odoo models before choosing a model for a task."""
+    """List the explicitly configured, guarded models available to generic tools."""
     try:
-        query = params.query.strip()
-        domain: list[Any] = [["transient", "=", False]]
-        if query:
-            domain.extend(["|", ["name", "ilike", query], ["model", "ilike", query]])
-        models = await client.call(
-            "ir.model",
-            "search_read",
-            {
-                "domain": domain,
-                "fields": ["id", "name", "model", "transient"],
-                "limit": params.limit,
-                "order": "name",
-            },
-            enforce_allowlist=False,
-        )
-        for model in models:
+        query = params.query.strip().casefold()
+        configured = [] if "*" in ODOO_ALLOWED_MODELS else sorted(ODOO_ALLOWED_MODELS)
+        models: list[dict[str, Any]] = []
+        for name in configured:
             try:
-                require_mutable_model(model["model"], ODOO_MUTABLE_MODELS)
+                require_readable_model(name)
+            except OdooAPIError:
+                continue
+            if query and query not in name.casefold():
+                continue
+            model = {"name": name, "model": name, "transient": False}
+            try:
+                require_mutable_model(name, ODOO_MUTABLE_MODELS)
                 model["mcp_generic_write_policy"] = True
             except OdooAPIError:
                 model["mcp_generic_write_policy"] = False
             model["mcp_delete_policy"] = "Allowed when Odoo grants unlink ACL and record-rule access"
-        return _json({"query": query, "models": models})
+            models.append(model)
+            if len(models) >= params.limit:
+                break
+        return _json({
+            "query": params.query.strip(),
+            "models": models,
+            "source": "configured guarded model allow-list",
+            "wildcard_not_enumerated": "*" in ODOO_ALLOWED_MODELS,
+        })
     except Exception as exc:
         return _error(exc)
 
@@ -883,7 +940,7 @@ async def odoo_model_catalog(params: ModelCatalogInput) -> str:
 async def odoo_search_count(params: SearchInput) -> str:
     """Count records matching an Odoo domain without reading record data."""
     try:
-        payload = {"domain": params.domain, "context": params.context}
+        payload = {"domain": params.domain, "context": _guard_read(params.model, None, params.context)}
         return _json({"count": await client.call(params.model, "search_count", payload)})
     except Exception as exc:
         return _error(exc)
@@ -898,7 +955,7 @@ async def odoo_search_read(params: SearchReadInput) -> str:
             "fields": params.fields,
             "limit": min(params.limit, ODOO_MAX_LIMIT),
             "offset": params.offset,
-            "context": params.context,
+            "context": _guard_read(params.model, params.fields, params.context),
         }
         if params.order:
             payload["order"] = params.order
@@ -929,7 +986,7 @@ async def odoo_read_group(params: ReadGroupInput) -> str:
             "aggregates": aggregates,
             "limit": limit,
             "offset": params.offset,
-            "context": params.context,
+            "context": _guard_read(params.model, [*params.groupby, *aggregates], params.context),
         }
         if params.order:
             payload["order"] = params.order
@@ -958,7 +1015,7 @@ async def odoo_read(params: ReadInput) -> str:
         payload = {
             "ids": params.ids,
             "fields": params.fields,
-            "context": params.context,
+            "context": _guard_read(params.model, params.fields, params.context),
             "load": None,
         }
         return _json(await client.call(params.model, "read", payload))
@@ -970,7 +1027,7 @@ async def odoo_read(params: ReadInput) -> str:
 async def odoo_fields_get(params: FieldsInput) -> str:
     """Describe fields for an allowlisted Odoo model."""
     try:
-        payload = {"attributes": params.attributes, "context": params.context}
+        payload = {"attributes": params.attributes, "context": _guard_read(params.model, None, params.context)}
         return _json(await client.call(params.model, "fields_get", payload))
     except Exception as exc:
         return _error(exc)
@@ -1431,26 +1488,20 @@ async def _impl_odoo_schedule_activity(params: ScheduleActivityInput) -> str:
         if not target:
             raise OdooAPIError("The target record does not exist or is not accessible.")
         user_id = params.user_id
-        if user_id is None:
-            context = await client.call("res.users", "context_get", {}, enforce_allowlist=False)
-            user_id = context.get("uid")
-        users = await client.call(
-            "res.users",
-            "search_read",
-            {
-                "domain": [["id", "=", user_id], ["active", "=", True], ["share", "=", False]],
-                "fields": ["id", "name"],
-                "limit": 1,
-            },
-            enforce_allowlist=False,
+        context = _safe_identity_context(
+            await client.call("res.users", "context_get", {}, enforce_allowlist=False, safe_read=True)
         )
-        if not users:
-            raise OdooAPIError("Activities may only be assigned to an active internal Odoo user.")
+        current_uid = context["uid"]
+        if user_id is not None and user_id != current_uid:
+            raise OdooAPIError("Activities may only be assigned to the connected Odoo user.")
+        user_id = current_uid
+        connection = identity.current_connection()
+        display = connection.display if isinstance(connection.display, dict) else {}
         preview = {
             "executed": False,
             "operation": "schedule_activity",
             "record": target[0],
-            "assigned_user": users[0],
+            "assigned_user": {"id": user_id, "name": display.get("name")},
             "summary": params.summary,
             "due_date": params.due_date,
             "external_recipients": [],

@@ -160,7 +160,9 @@ class PinnedTransport(httpx.AsyncBaseTransport):
 
     def __init__(self, *, denied_hosts: frozenset[str] = frozenset(), verify: bool | str = True,
                  allowed_hosts: frozenset[str] = frozenset()):
-        self._inner = httpx.AsyncHTTPTransport(verify=verify, retries=0, http2=False)
+        # trust_env stays off on the transport itself. The client's flag does not apply to a
+        # transport the caller supplies, and the default would honour SSL_CERT_FILE / SSL_CERT_DIR.
+        self._inner = httpx.AsyncHTTPTransport(verify=verify, retries=0, http2=False, trust_env=False)
         self._denied = frozenset(h.lower() for h in denied_hosts)
         # An app that talks to fixed hosts only (kSuite): any other host is refused before any DNS lookup.
         self._allowed = frozenset(h.lower() for h in allowed_hosts)

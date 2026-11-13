@@ -86,12 +86,40 @@ def validate_redirect_uri(uri: str, application_type: str) -> str:
     raise ClientError("invalid_redirect_uri", "redirect URIs must use https (or loopback http for native apps)")
 
 
+def _redirect_kind(uri: str) -> str:
+    """``web`` for an exact https URI, ``native`` for loopback http or a private-use scheme."""
+    parts = urlsplit(uri)
+    if not parts.scheme or "*" in uri or parts.fragment or parts.username or parts.password:
+        raise ClientError("invalid_redirect_uri", "redirect URIs must be exact, without wildcard, fragment or user info")
+    if parts.scheme == "https" and parts.hostname:
+        return "web"
+    if is_loopback(uri):
+        return "native"
+    if parts.scheme not in ("http", "https", "javascript", "data", "file") and "." in parts.scheme:
+        return "native"
+    raise ClientError("invalid_redirect_uri", "redirect URIs must use https (or loopback http for native apps)")
+
+
+def cimd_client_redirects(uris: list[str]) -> tuple[tuple[str, ...], str]:
+    """Validate every CIMD redirect. Port-ignoring native mode only when every URI is native.
+
+    A document that mixes https with loopback stays ``web``, so one loopback address
+    cannot make every other redirect ignore its port. One bad URI rejects the document.
+    """
+    kinds = [_redirect_kind(uri) for uri in uris]
+    application_type = "native" if kinds and all(kind == "native" for kind in kinds) else "web"
+    return tuple(uris), application_type
+
+
 def known_assistant(settings: Settings, client: ClientInfo, redirect_uri: str) -> Assistant | None:
-    """The operator-listed assistant this sign-in verifiably comes from, if any."""
+    """The operator-listed assistant this sign-in verifiably comes from, if any.
+
+    A CIMD host matches a listed host by equality only. ``evil.claude.ai`` is not ``claude.ai``.
+    """
     if client.kind == "cimd":
         host = (urlsplit(client.client_id).hostname or "").lower()
         for assistant in settings.assistants:
-            if host and any(host == h or host.endswith("." + h) for h in assistant.cimd_hosts):
+            if host and any(host == h for h in assistant.cimd_hosts):
                 if is_loopback(redirect_uri) and not assistant.loopback:
                     continue
                 return assistant
@@ -155,8 +183,8 @@ async def load_client(client_id: str, store: Store, settings: Settings) -> Clien
         uris = doc.get("redirect_uris")
         if not isinstance(uris, list) or not all(isinstance(u, str) for u in uris) or not uris:
             raise ClientError("invalid_client", "the client metadata document has no redirect URIs")
-        app_type = "native" if any(is_loopback(u) for u in uris) else str(doc.get("application_type") or "web")
-        return ClientInfo(client_id=client_id, kind="cimd", redirect_uris=tuple(uris),
+        checked, app_type = cimd_client_redirects(list(uris))
+        return ClientInfo(client_id=client_id, kind="cimd", redirect_uris=checked,
                           client_name=str(doc.get("client_name") or urlsplit(client_id).hostname),
                           application_type=app_type, auth_method="none")
     cached = store.get_client(client_id)

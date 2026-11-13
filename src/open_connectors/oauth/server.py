@@ -62,8 +62,27 @@ SECURITY_HEADERS = {
 }
 
 
+TOOL_SCOPES = ("read", "write", "send", "offline_access")
+
+
+def narrow_scope(requested: str) -> str:
+    """Keep only scopes this connector advertises, in request order.
+
+    An empty query, or ``offline_access`` alone, grants no tool. ``read``, ``write`` and
+    ``send`` are never added on the client's behalf.
+    """
+    kept: list[str] = []
+    for part in (requested or "").split():
+        if part in TOOL_SCOPES and part not in kept:
+            kept.append(part)
+    return " ".join(kept)
+
+
 class RateLimiter:
-    """Small in-memory sliding-window limiter (one process per app)."""
+    """Small in-memory sliding-window limiter.
+
+    One process only: a second worker or another machine does not share the counts.
+    """
 
     def __init__(self) -> None:
         self._hits: dict[tuple[str, str], deque[float]] = defaultdict(deque)
@@ -168,7 +187,7 @@ class AuthServer:
             "revocation_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
             "client_id_metadata_document_supported": True,
             "authorization_response_iss_parameter_supported": True,
-            "scopes_supported": ["offline_access"],
+            "scopes_supported": ["read", "write", "send", "offline_access"],
             "service_documentation": self.s.source_url,
         }
 
@@ -184,7 +203,7 @@ class AuthServer:
             "resource": resource,
             "authorization_servers": [self.s.issuer],
             "bearer_methods_supported": ["header"],
-            "scopes_supported": [],
+            "scopes_supported": ["read", "write", "send", "offline_access"],
             "resource_name": pages.APP_NAMES.get(self.app.NAME, self.app.NAME),
             "resource_documentation": self.s.source_url,
         }, headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "max-age=300"})
@@ -289,8 +308,9 @@ class AuthServer:
         cookie_key = secrets.token_urlsafe(32)
         flow = {
             "client_id": client.client_id, "redirect_uri": redirect_uri, "state": state, "code_challenge": challenge,
-            "resource": resource, "scope": q.get("scope", ""), "fixed_host": fixed_host,
+            "resource": resource, "scope": narrow_scope(q.get("scope", "")), "fixed_host": fixed_host,
             "verified_name": assistant.name if assistant else None, "claimed_name": client.client_name,
+            "document_host": (urlsplit(client.client_id).hostname or "").lower() if client.kind == "cimd" else "",
             "return_host": urlsplit(redirect_uri).netloc or redirect_uri.split(":", 1)[0],
             "csrf": secrets.token_urlsafe(24), "cookie_check": digest(cookie_key), "step": "server", "attempts": 0,
         }
@@ -331,7 +351,8 @@ class AuthServer:
 
     def _asking(self, flow: dict[str, Any]) -> pages.Asking:
         return pages.Asking(verified_name=flow.get("verified_name"), claimed_name=flow.get("claimed_name") or "?",
-                            return_host=flow.get("return_host") or "?")
+                            return_host=flow.get("return_host") or "?",
+                            document_host=flow.get("document_host") or "")
 
     def _login_flow(self) -> bool:
         return bool(getattr(self.app, "LOGIN_FLOW", False))
