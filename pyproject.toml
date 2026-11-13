@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-mcp-odoo"
+version = "0.1.0"
+description = "Connect any assistant to your own Odoo: you bring your server or account and your own key."
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.12"
+dependencies = [
+  "fastmcp==4.1.6",
+  "mcp==2.3.0",
+  "httpx==0.28.1",
+  "idna>=3.10",
+  "cryptography>=44",
+  "starlette>=0.47",
+  "uvicorn>=0.35",
+  "pydantic>=2.11",
+  "pyyaml>=6",
+  "pypdf>=5",
+  "python-docx>=1.1",
+  "openpyxl>=3.1",
+  "python-pptx>=1.0",
+]
+
+[project.scripts]
+open-connectors = "open_connectors.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

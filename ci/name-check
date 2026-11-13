@@ -1,0 +1,20 @@
+#!/bin/sh
+# Fails if any word from a private list (organization, people and server names)
+# appears in the tracked files, or if a file looks like it holds a secret.
+# The list itself is kept OUTSIDE this repository: NAME_CHECK_FILE=/path/to/words
+set -eu
+list="${NAME_CHECK_FILE:?set NAME_CHECK_FILE to a private file with one word per line}"
+status=0
+# DESIGN.md (brand rule) and SECURITY.md (security contact) name the publisher on purpose; no code, setting or address may.
+if git grep -I -n -i -w -F -f "$list" -- . ':!LICENSE' ':!DESIGN.md' ':!SECURITY.md' >/dev/null 2>&1; then
+  echo "name check: FOUND organization-specific words:" >&2
+  git grep -I -n -i -w -F -f "$list" -- . ':!LICENSE' ':!DESIGN.md' ':!SECURITY.md' | cut -d: -f1,2 >&2
+  status=1
+fi
+if git grep -I -n -E '(BEGIN [A-Z ]*PRIVATE KEY|ghp_[A-Za-z0-9]{30,}|glpat-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})' -- . >/dev/null 2>&1; then
+  echo "name check: FOUND secret-shaped strings:" >&2
+  git grep -I -n -E '(BEGIN [A-Z ]*PRIVATE KEY|ghp_[A-Za-z0-9]{30,}|glpat-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})' -- . | cut -d: -f1,2 >&2
+  status=1
+fi
+[ "$status" -eq 0 ] && echo "name check: clean"
+exit "$status"

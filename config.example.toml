@@ -1,0 +1,10 @@
+# open-mcp-odoo — one process, one public host. Nothing here is secret.
+public_url = "https://odoo.example.org"
+app = "odoo"
+state_dir = "/var/lib/open-mcp-odoo"
+source_url = "https://github.com/etlyon/open-mcp-odoo"
+maker_label = "open source"
+other_assistants = true
+# Only these Odoo hosts may connect (exact). Empty = any public server.
+allowed_servers = []
+denied_hosts = []

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+/state/
+config.toml
+.DS_Store
+
+*.egg-info/
