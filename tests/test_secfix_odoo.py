@@ -24,6 +24,15 @@ class BigBody(httpx.AsyncBaseTransport):
 
 
 class OdooSecurity(unittest.IsolatedAsyncioTestCase):
+    def test_search_read_order_uses_the_grouped_read_validator(self):
+        valid = tools.SearchReadInput(
+            model="res.partner", fields=["name"], order="name ASC, create_date DESC",
+        )
+        self.assertEqual(valid.order, "name ASC, create_date DESC")
+        for invalid in ("name; DROP TABLE res_partner", "name NULLS FIRST", "name " + "x" * 200):
+            with self.subTest(order=invalid), self.assertRaises(ValueError):
+                tools.SearchReadInput(model="res.partner", fields=["name"], order=invalid)
+
     def test_default_models_are_an_explicit_list(self):
         self.assertNotIn("*", DEFAULT_ALLOWED_MODELS)
         self.assertNotIn("*", DEFAULT_MUTABLE_MODELS)

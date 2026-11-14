@@ -9,13 +9,15 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from fastmcp.exceptions import ToolError
+from starlette.requests import Request
 
 from open_connectors import net, policy
 from open_connectors.config import DEFAULT_ASSISTANTS, Settings
 from open_connectors.oauth.clients import ClientError, ClientInfo, cimd_client_redirects, known_assistant
-from open_connectors.oauth.server import narrow_scope
+from open_connectors.oauth.server import AuthServer, narrow_scope
 from open_connectors.pages.flow import error_text
 from open_connectors.throttle import Throttle
 
@@ -55,6 +57,22 @@ class Tool:
 
 
 class SharedSecurity(unittest.IsolatedAsyncioTestCase):
+    async def test_revoke_uses_the_token_endpoint_rate_limit(self):
+        limiter = Mock()
+        limiter.allow.return_value = False
+        server = object.__new__(AuthServer)
+        server.limits = limiter
+        request = Request({
+            "type": "http", "method": "POST", "path": "/revoke", "headers": [],
+            "client": ("203.0.113.7", 54321),
+        })
+
+        response = await AuthServer.revoke(server, request)
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.body, b'{"error":"slow_down"}')
+        limiter.allow.assert_called_once_with("revoke", "203.0.113.7", 120, 60)
+
     def test_cimd_host_matches_exactly(self):
         settings = _settings()
         self.assertIsNone(known_assistant(settings, _cimd("evil.claude.ai"), "https://assistant.example/cb"))

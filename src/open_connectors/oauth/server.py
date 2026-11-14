@@ -782,6 +782,8 @@ class AuthServer:
         return self._token_error("unsupported_grant_type")
 
     async def revoke(self, request: Request) -> Response:
+        if not self.limits.allow("revoke", client_ip(request), 120, 60):
+            return self._token_error("slow_down", 429)
         form = await request.form()
         client = await self._client_auth(request, form)
         if isinstance(client, Response):

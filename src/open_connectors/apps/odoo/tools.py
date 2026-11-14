@@ -304,17 +304,39 @@ class SearchInput(ModelInput):
     context: dict[str, Any] = Field(default_factory=dict)
 
 
+_SPEC_NAME = r"[A-Za-z_][A-Za-z0-9_]{0,62}(?:\.[A-Za-z_][A-Za-z0-9_]{0,62})?"
+_GROUPBY_SPEC = re.compile(rf"^{_SPEC_NAME}(?::[a-z][a-z0-9_]{{0,31}})?$")
+_AGGREGATE_SPEC = re.compile(rf"^{_SPEC_NAME}:([a-z][a-z0-9_]{{0,31}})$")
+_ORDER_TERM = re.compile(rf"^{_SPEC_NAME}(?::[a-z][a-z0-9_]{{0,31}})?(?: (?:asc|desc))?$", re.IGNORECASE)
+
+
 class SearchReadInput(SearchInput):
     fields: list[str] = Field(description="Explicit fields to return")
     limit: int = Field(default=20, ge=1, le=500)
     offset: int = Field(default=0, ge=0)
-    order: str | None = Field(default=None, description="Odoo order expression")
+    order: str | None = Field(
+        default=None,
+        max_length=200,
+        description="Order expression, for example 'name ASC, create_date DESC'",
+    )
 
     @field_validator("fields")
     @classmethod
     def require_fields(cls, value: list[str]) -> list[str]:
         if not value:
             raise ValueError("At least one field is required.")
+        return value
+
+    @field_validator("order")
+    @classmethod
+    def check_order(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        for term in value.split(","):
+            if not _ORDER_TERM.fullmatch(term.strip()):
+                raise ValueError(
+                    f"Invalid order term '{term.strip()}'. Use '<spec> [ASC|DESC]', comma separated."
+                )
         return value
 
 
@@ -331,11 +353,6 @@ READ_GROUP_METHOD = "formatted_read_group"
 # hop, optionally one ":suffix" (a date granularity for a groupby, an aggregate
 # method for an aggregate). Anchored and punctuation-free, so no expression,
 # quote, parenthesis, comma or space can reach Odoo's group-by parser.
-_SPEC_NAME = r"[A-Za-z_][A-Za-z0-9_]{0,62}(?:\.[A-Za-z_][A-Za-z0-9_]{0,62})?"
-_GROUPBY_SPEC = re.compile(rf"^{_SPEC_NAME}(?::[a-z][a-z0-9_]{{0,31}})?$")
-_AGGREGATE_SPEC = re.compile(rf"^{_SPEC_NAME}:([a-z][a-z0-9_]{{0,31}})$")
-_ORDER_TERM = re.compile(rf"^{_SPEC_NAME}(?::[a-z][a-z0-9_]{{0,31}})?(?: (?:asc|desc))?$", re.IGNORECASE)
-
 # Odoo 19's aggregate vocabulary. sum, avg, min, max, count, count_distinct and
 # array_agg were confirmed against the live server; bool_and and bool_or are the
 # remaining pair Odoo accepts. Anything else is refused before any Odoo call.
