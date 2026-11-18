@@ -5,8 +5,8 @@ Use the connector's full public address, including `/mcp`, for example
 the connector discovers OAuth and asks each person to approve their own account.
 
 These menu paths were checked against the vendors' public instructions on
-18 November 2026. They are publication instructions, not a claim that ETLYON
-clicked them in a paid vendor seat.
+18 November 2026. They are publication instructions; the steps were not
+clicked through in a paid vendor seat.
 
 ## Claude
 

@@ -5,10 +5,31 @@
 set -eu
 list="${NAME_CHECK_FILE:?set NAME_CHECK_FILE to a private file with one word per line}"
 status=0
-# DESIGN.md (brand rule) and SECURITY.md (security contact) name the publisher on purpose; no code, setting or address may.
-if git grep -I -n -i -w -F -f "$list" -- . ':!LICENSE' ':!DESIGN.md' ':!SECURITY.md' >/dev/null 2>&1; then
+hits="$(mktemp)"
+blocked="$(mktemp)"
+trap 'rm -f "$hits" "$blocked"' EXIT HUP INT TERM
+# DESIGN.md (brand rule) and SECURITY.md (security contact) name the publisher on purpose. The public publisher
+# notice and public source_url are the only two attribution slots outside them; every other tracked location fails.
+git grep -I -n -i -w -F -f "$list" -- . ':!LICENSE' ':!DESIGN.md' ':!SECURITY.md' >"$hits" 2>/dev/null || true
+while IFS=: read -r file line content; do
+  [ -n "$file" ] || continue
+  case "$file:$line" in
+    README.md:1)
+      case "$content" in
+        "This code was written with the help of generative AI tools and reviewed by "*". It is intended for professional use; test it in your environment before production. Provided as is, without warranty.") continue ;;
+      esac
+      ;;
+    config.example.toml:5|config.example.toml:6)
+      case "$content" in
+        'source_url = "https://github.com/'*'/open-mcp-'*'"') continue ;;
+      esac
+      ;;
+  esac
+  printf '%s:%s\n' "$file" "$line" >>"$blocked"
+done <"$hits"
+if [ -s "$blocked" ]; then
   echo "name check: FOUND organization-specific words:" >&2
-  git grep -I -n -i -w -F -f "$list" -- . ':!LICENSE' ':!DESIGN.md' ':!SECURITY.md' | cut -d: -f1,2 >&2
+  cat "$blocked" >&2
   status=1
 fi
 if git grep -I -n -E '(BEGIN [A-Z ]*PRIVATE KEY|ghp_[A-Za-z0-9]{30,}|glpat-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})' -- . >/dev/null 2>&1; then

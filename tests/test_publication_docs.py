@@ -1,3 +1,7 @@
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -42,6 +46,38 @@ class PublicationDocsTests(unittest.TestCase):
         self.assertIn("0 findings", proof)
         self.assertNotIn("/home/", proof)
         self.assertNotIn("~/.cache", proof)
+
+    def test_name_gate_allows_only_exact_public_attribution_locations(self):
+        private_name = "ExamplePrivateOperator"
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            repo = base / "repo"
+            (repo / "ci").mkdir(parents=True)
+            (repo / "docs").mkdir()
+            shutil.copy2(ROOT / "ci" / "name-check", repo / "ci" / "name-check")
+            os.chmod(repo / "ci" / "name-check", 0o755)
+            (repo / "README.md").write_text(
+                "This code was written with the help of generative AI tools and reviewed by "
+                f"{private_name}. It is intended for professional use; test it in your environment "
+                "before production. Provided as is, without warranty.\n"
+            )
+            (repo / "config.example.toml").write_text(
+                "one = 1\ntwo = 2\nthree = 3\nfour = 4\n"
+                f'source_url = "https://github.com/{private_name}/open-mcp-sample"\n'
+            )
+            (repo / "docs" / "assistants.md").write_text("Generic publication guide.\n")
+            words = base / "private-words.txt"
+            words.write_text(private_name + "\n")
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            env = {**os.environ, "NAME_CHECK_FILE": str(words)}
+            allowed = subprocess.run(["ci/name-check"], cwd=repo, env=env, text=True, capture_output=True)
+            self.assertEqual(allowed.returncode, 0, allowed.stderr)
+            (repo / "docs" / "leak.md").write_text(private_name + "\n")
+            subprocess.run(["git", "add", "docs/leak.md"], cwd=repo, check=True)
+            refused = subprocess.run(["ci/name-check"], cwd=repo, env=env, text=True, capture_output=True)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("docs/leak.md:1", refused.stderr)
 
 
 if __name__ == "__main__":
